@@ -3,6 +3,7 @@ use clap::{Parser, ValueEnum};
 use futures::AsyncReadExt;
 use s2n_quic::Client;
 use s2n_quic::client::Connect;
+use s2n_quic::provider::congestion_controller::Bbr;
 use s2n_quic::provider::datagram::default::{Endpoint, Receiver, Sender};
 use s2n_quic::{Server, provider::io::tokio::Builder as IoBuilder};
 use std::collections::VecDeque;
@@ -64,7 +65,7 @@ struct Args {
     key: String,
 
     /// QUIC congestion control algorithm (cubic, bbr, newreno)
-    #[arg(long = "cc", default_value = "cubic", value_parser = ["cubic", "bbr", "newreno"])]
+    #[arg(long = "cc", default_value = "cubic", value_parser = ["cubic", "bbr"])]
     pub congestion_algorithm: String,
 }
 
@@ -121,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("CA: {:?}", args.ca);
     println!("Cert: {:?}", args.cert);
     println!("Key: {:?}", args.key);
+    println!("Congestion Algorithm: {:?}", args.congestion_algorithm);
     println!("============================");
 
     match (args.mode, args.scene) {
@@ -130,9 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Mode::Client, Scene::Dgram) => {
             run_quic_dgram_client(&args.addr, &args.ca, args.packet_size).await?
         }
-        (Mode::Client, Scene::Stream) => {
-            run_quic_stream_client(&args.addr, &args.ca, args.packet_size).await?
-        }
+        (Mode::Client, Scene::Stream) => run_quic_stream_client(args).await?,
         (Mode::Server, Scene::Stream) => run_quic_stream_server(args).await?,
     }
 
@@ -249,7 +249,7 @@ async fn run_quic_dgram_client(
     let bytes_sent = Arc::new(AtomicU64::new(0));
 
     // 创建测试数据包
-    let packet_data = Bytes::from(vec![0xAB; packet_size]);
+    let packet_data = Bytes::from(vec![0xABu8; packet_size]);
 
     let connect = Connect::new(addr).with_server_name("localhost");
     let connection = client.connect(connect).await?;
@@ -296,12 +296,8 @@ async fn run_quic_dgram_client(
 }
 
 /// QUIC 流式客户端实现
-async fn run_quic_stream_client(
-    addr: &str,
-    ca: &str,
-    packet_size: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = addr.parse()?;
+async fn run_quic_stream_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = args.addr.parse()?;
     let io = IoBuilder::default()
         .with_receive_address("0.0.0.0:0".parse()?)?
         .with_base_mtu(1500)?
@@ -311,15 +307,21 @@ async fn run_quic_stream_client(
         .build()?;
 
     let client = Client::builder()
-        .with_tls(Path::new(ca))?
-        .with_io(io)?
-        .start()
-        .unwrap();
+        .with_tls(Path::new(&args.ca))?
+        .with_io(io)?;
+
+    let client = match args.congestion_algorithm.as_str() {
+        "bbr" => client
+            .with_congestion_controller(Bbr::default())?
+            .start()
+            .unwrap(),
+        _ => client.start().unwrap(),
+    };
 
     let bytes_sent = Arc::new(AtomicU64::new(0));
 
     // 创建测试数据包
-    let packet_data = vec![0xABu8; packet_size];
+    let packet_data = vec![0xABu8; args.packet_size];
 
     let connect = Connect::new(addr).with_server_name("localhost");
     let mut connection = client.connect(connect).await?;
@@ -335,7 +337,7 @@ async fn run_quic_stream_client(
     loop {
         match stream.write_all(&packet_data).await {
             Ok(_) => {
-                bytes_sent.fetch_add(packet_size as u64, Ordering::Relaxed);
+                bytes_sent.fetch_add(args.packet_size as u64, Ordering::Relaxed);
             }
             Err(e) => {
                 eprintln!("Failed to send stream: {e:?}");
@@ -355,13 +357,19 @@ async fn run_quic_stream_server(args: Args) -> Result<(), Box<dyn std::error::Er
         .with_initial_mtu(1500)?
         .build()
         .unwrap();
-    let mut server = Server::builder()
+    let server = Server::builder()
         .with_tls((Path::new(&args.cert), Path::new(&args.key)))?
-        .with_io(io)?
-        .start()
-        .unwrap();
+        .with_io(io)?;
 
-    println!("QUIC datagram server listening on {}", addr);
+    let mut server = match args.congestion_algorithm.as_str() {
+        "bbr" => server
+            .with_congestion_controller(Bbr::default())?
+            .start()
+            .unwrap(),
+        _ => server.start().unwrap(),
+    };
+
+    println!("QUIC stream server listening on {}", addr);
     let bytes_received = Arc::new(AtomicU64::new(0));
 
     // 启动统计任务
