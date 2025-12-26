@@ -1,58 +1,68 @@
+use bytes::Bytes;
 use clap::{Parser, ValueEnum};
-use socket2::Socket as Socket2;
-use socket2::{Domain, Protocol, Type};
+use s2n_quic::Client;
+use s2n_quic::client::Connect;
+use s2n_quic::provider::datagram::default::{Endpoint, Receiver, Sender};
+use s2n_quic::{Server, provider::io::tokio::Builder as IoBuilder};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::time::interval;
 
 #[derive(Clone, Debug, ValueEnum)]
 enum Mode {
+    #[value(name = "client")]
     Client,
+    #[value(name = "server")]
     Server,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
 enum Scene {
-    #[value(name = "udp")]
-    Udp,
-    #[value(name = "quic-dgram")]
-    QuicDgram,
+    #[value(name = "stream")]
+    Stream,
+    #[value(name = "dgram")]
+    Dgram,
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "s2n-bench")]
 #[command(about = "Network throughput testing tool", long_about = None)]
 struct Args {
-    /// Operation mode: client or server
-    #[arg(value_enum, long)]
+    /// Running mode: client or server
+    #[arg(short, long)]
     mode: Mode,
 
-    /// Test scene: udp (default: udp)
-    #[arg(value_enum, long, default_value = "udp")]
+    /// Listen or connect address (ip:port)
+    #[arg(value_enum, short, long)]
+    addr: String,
+
+    /// Test scenario: stream or dgram
+    #[arg(value_enum, short = 's', long)]
     scene: Scene,
 
-    /// Host address for server binding or client connection (default: 127.0.0.1)
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-
-    /// Port number for listening (server) or target (client)
-    #[arg(short, long)]
-    port: u16,
-
-    /// Packet size in bytes (default: 1024)
-    #[arg(short = 's', long, default_value = "1024")]
+    /// Packet size in bytes
+    #[arg(short = 'p', long, default_value = "1350")]
     packet_size: usize,
 
-    /// Path to certificate file (required for quic-dgram)
-    #[arg(long)]
-    cert_file: Option<String>,
+    /// CA certificate path (client mode)
+    #[arg(long, default_value = "./ca.crt")]
+    ca: String,
 
-    /// Path to private key file (required for quic-dgram)
-    #[arg(long)]
-    key_file: Option<String>,
+    /// Server certificate path
+    #[arg(long, default_value = "./server.crt")]
+    cert: String,
+
+    /// Server private key path
+    #[arg(long, default_value = "./server.key")]
+    key: String,
+
+    /// QUIC congestion control algorithm (cubic, bbr, newreno)
+    #[arg(long = "cc", default_value = "cubic", value_parser = ["cubic", "bbr", "newreno"])]
+    pub congestion_algorithm: String,
 }
 
 /// 启动统计任务，定时打印吞吐量信息
@@ -70,10 +80,10 @@ async fn start_stats_task(
             let current_bytes = bytes_counter.load(Ordering::Relaxed);
             let bytes_per_sec = current_bytes - last_bytes;
             let total_mb = current_bytes as f64 / (1024.0 * 1024.0);
-            let mb_per_sec = bytes_per_sec as f64 / (1024.0 * 1024.0);
+            let mb_per_sec = bytes_per_sec as f64 / (1000.0 * 1000.0) * 8.0;
 
             println!(
-                "Total {}: {:.2} MB, Speed: {:.2} MB/s",
+                "Total {}: {:.2} MB, Speed: {:.2} Mbps",
                 stats_type, total_mb, mb_per_sec
             );
             last_bytes = current_bytes;
@@ -86,165 +96,180 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // console_subscriber::init();
     let args = Args::parse();
 
+    println!("=== Command Line Arguments ===");
+    println!("Mode: {:?}", args.mode);
+    println!("Addr: {:?}", args.addr);
+    println!("Scene: {:?}", args.scene);
+    println!("Packet Size: {}", args.packet_size);
+    println!("CA: {:?}", args.ca);
+    println!("Cert: {:?}", args.cert);
+    println!("Key: {:?}", args.key);
+    println!("============================");
+
     match (args.mode, args.scene) {
-        (Mode::Server, Scene::Udp) => run_udp_server(&args.host, args.port).await?,
-        (Mode::Client, Scene::Udp) => {
-            run_udp_client(&args.host, args.port, args.packet_size).await?
+        (Mode::Server, Scene::Dgram) => {
+            run_quic_dgram_server(&args.addr, &args.cert, &args.key).await?
         }
-        (Mode::Server, Scene::QuicDgram) => {
-            let cert_file = args
-                .cert_file
-                .ok_or("Certificate file is required for QUIC server")?;
-            let key_file = args
-                .key_file
-                .ok_or("Private key file is required for QUIC server")?;
-            run_quic_dgram_server(&args.host, args.port, &cert_file, &key_file).await?
+        (Mode::Client, Scene::Dgram) => {
+            run_quic_dgram_client(&args.addr, &args.ca, args.packet_size).await?
         }
-        (Mode::Client, Scene::QuicDgram) => {
-            run_quic_dgram_client(&args.host, args.port, args.packet_size).await?
-        }
+        (Mode::Client, Scene::Stream) => todo!(),
+        (Mode::Server, Scene::Stream) => todo!(),
     }
 
     Ok(())
 }
 
-/// UDP 服务器实现
-async fn run_udp_server(host: &str, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = format!("{}:{}", host, port);
-    let socket = UdpSocket::bind(&addr).await?;
-    println!("UDP server listening on {}", addr);
-
-    let bytes_received = Arc::new(AtomicU64::new(0));
-    let bytes_received_clone = Arc::clone(&bytes_received);
-
-    // 启动统计任务
-    let _stats_handle = start_stats_task(bytes_received_clone, "received").await;
-
-    let mut buf = vec![0u8; 65536]; // UDP 最大包大小
-
-    loop {
-        match socket.recv_from(&mut buf).await {
-            Ok((len, _addr)) => {
-                bytes_received.fetch_add(len as u64, Ordering::Relaxed);
-            }
-            Err(e) => {
-                eprintln!("Error receiving packet: {}", e);
-            }
-        }
-    }
-}
-
-/// UDP 客户端实现
-async fn run_udp_client(
-    host: &str,
-    port: u16,
-    packet_size: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let target_addr = format!("{}:{}", host, port);
-    let server_addr: SocketAddr = target_addr.parse()?;
-    let local_addr = "0.0.0.0:0";
-    let socket = UdpSocket::bind(local_addr).await?;
-
-    println!(
-        "UDP client connecting to {} (packet size: {} bytes)",
-        target_addr, packet_size
-    );
-
-    let bytes_sent = Arc::new(AtomicU64::new(0));
-    let bytes_sent_clone = Arc::clone(&bytes_sent);
-
-    // 创建测试数据包
-    let packet_data = vec![0xAB; packet_size];
-
-    // 启动统计任务
-    let _stats_handle = start_stats_task(bytes_sent_clone, "sent").await;
-
-    loop {
-        match socket.send_to(&packet_data, server_addr).await {
-            Ok(sent_bytes) => {
-                bytes_sent.fetch_add(sent_bytes as u64, Ordering::Relaxed);
-            }
-            Err(e) => {
-                eprintln!("Error sending packet: {}", e);
-            }
-        }
-
-        // 添加微小延迟以避免过度占用 CPU
-        // tokio::task::yield_now().await;
-    }
-}
-
 /// QUIC 数据报服务器实现
 async fn run_quic_dgram_server(
-    host: &str,
-    port: u16,
+    addr: &str,
     cert_file: &str,
     key_file: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-    let socket = Socket2::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-
-    // 2. 设置缓冲区
-    if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-        eprintln!("Warning: Failed to set send buffer size: {}", e);
-    }
-    if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-        eprintln!("Warning: Failed to set receive buffer size: {}", e);
-    }
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-
-    let std_sock: std::net::UdpSocket = socket.into();
-    let socket = UdpSocket::from_std(std_sock)?;
+    let addr: SocketAddr = addr.parse()?;
+    let io = IoBuilder::default()
+        .with_receive_address(addr)?
+        .with_base_mtu(1500)?
+        .with_initial_mtu(1500)?
+        .with_send_buffer_size(4 * 1024 * 1024)?
+        .with_recv_buffer_size(4 * 1024 * 1024)?
+        .build()
+        .unwrap();
+    // Create a datagram provider that has recv queue capacity
+    let datagram_provider = Endpoint::builder()
+        .with_recv_capacity(65536)?
+        .build()
+        .unwrap();
+    let mut server = Server::builder()
+        .with_tls((Path::new(cert_file), Path::new(key_file)))?
+        .with_io(io)?
+        .with_datagram(datagram_provider)?
+        .start()
+        .unwrap();
 
     println!("QUIC datagram server listening on {}", addr);
     let bytes_received = Arc::new(AtomicU64::new(0));
-    let bytes_received_clone = Arc::clone(&bytes_received);
 
     // 启动统计任务
-    let _stats_handle = start_stats_task(bytes_received_clone, "received").await;
+    let _stats_handle = start_stats_task(Arc::clone(&bytes_received), "received").await;
+
+    while let Some(connection) = server.accept().await {
+        // spawn a new task for the connection
+        let bytes_clone = Arc::clone(&bytes_received);
+        tokio::spawn(async move {
+            println!("Connection accepted from {:?}", connection.remote_addr());
+            loop {
+                let recv_result = futures::future::poll_fn(|cx| {
+                    // datagram_mut takes a closure which calls the requested datagram function. The type
+                    // of the closure parameter should be either the datagram Sender type or the
+                    // datagram Receiver type. The datagram_mut function will check this type against
+                    // its stored datagram Sender and Receiver, and if the type matches, the requested
+                    // function will execute. Here, that requested function is poll_recv_datagram.
+                    match connection.datagram_mut(|recv: &mut Receiver| recv.poll_recv_datagram(cx))
+                    {
+                        // If the function is successfully called on the provider, it will return Poll<Bytes>.
+                        // Here we send an Ok() to wrap around the Bytes so the poll_fn doesn't complain.
+                        Ok(poll_value) => poll_value.map(Ok),
+                        // The datagram_mut function may return a query error if it can't find the type
+                        // referenced in the closure. Here we wrap the error in a Poll::Ready enum so the
+                        // poll_fn doesn't complain.
+                        Err(query_err) => Poll::Ready(Err(query_err)),
+                    }
+                })
+                .await;
+
+                match recv_result {
+                    Ok(value) => match value {
+                        Ok(bytes) => {
+                            bytes_clone.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to receive datagram: {err:?}");
+                        }
+                    },
+                    Err(err) => {
+                        eprintln!("Failed to query datagram receiver: {err:?}");
+                    }
+                }
+            }
+        });
+    }
 
     todo!()
 }
 
 /// QUIC 数据报客户端实现
 async fn run_quic_dgram_client(
-    host: &str,
-    port: u16,
+    addr: &str,
+    ca: &str,
     packet_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let target_addr = format!("{}:{}", host, port);
-    let server_addr: SocketAddr = target_addr.parse()?;
-    let local_addr: SocketAddr = "0.0.0.0:0".parse()?;
+    let addr: SocketAddr = addr.parse()?;
+    let io = IoBuilder::default()
+        .with_receive_address("0.0.0.0:0".parse()?)?
+        .with_base_mtu(1500)?
+        .with_initial_mtu(1500)?
+        .with_send_buffer_size(4 * 1024 * 1024)?
+        .with_recv_buffer_size(4 * 1024 * 1024)?
+        .build()?;
+    // Create a datagram provider that has recv queue capacity
+    let datagram_provider = Endpoint::builder()
+        .with_send_capacity(65536)?
+        .build()
+        .unwrap();
 
-    let socket = Socket2::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    // 2. 设置缓冲区
-    if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-        eprintln!("Warning: Failed to set send buffer size: {}", e);
-    }
-    if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-        eprintln!("Warning: Failed to set receive buffer size: {}", e);
-    }
-    socket.set_nonblocking(true)?;
-    socket.bind(&local_addr.into())?;
-
-    let std_sock: std::net::UdpSocket = socket.into();
-    let socket = UdpSocket::from_std(std_sock)?;
-
-    println!(
-        "QUIC datagram client connecting to {} (packet size: {} bytes)",
-        target_addr, packet_size
-    );
+    let client = Client::builder()
+        .with_tls(Path::new(ca))?
+        .with_io(io)?
+        .with_datagram(datagram_provider)?
+        .start()
+        .unwrap();
 
     let bytes_sent = Arc::new(AtomicU64::new(0));
-    let bytes_sent_clone = Arc::clone(&bytes_sent);
 
     // 创建测试数据包
-    let packet_data = vec![0xAB; packet_size];
+    let packet_data = Bytes::from(vec![0xAB; packet_size]);
+
+    let connect = Connect::new(addr).with_server_name("localhost");
+    let connection = client.connect(connect).await?;
+
+    println!("Success to connect to {addr:?}");
 
     // 启动统计任务
-    let _stats_handle = start_stats_task(bytes_sent_clone, "sent").await;
+    let _stats_handle = start_stats_task(Arc::clone(&bytes_sent), "sent").await;
 
-    socket.connect(server_addr).await.unwrap();
-    todo!()
+    loop {
+        let send_result = futures::future::poll_fn(|cx| {
+            // datagram_mut takes a closure which calls the requested datagram function. The type
+            // of the closure parameter should be either the datagram Sender type or the
+            // datagram Receiver type. The datagram_mut function will check this type against
+            // its stored datagram Sender and Receiver, and if the type matches, the requested
+            // function will execute. Here, that requested function is poll_recv_datagram.
+            match connection.datagram_mut(|send: &mut Sender| {
+                send.poll_send_datagram(&mut Bytes::clone(&packet_data), cx)
+            }) {
+                // If the function is successfully called on the provider, it will return Poll<Bytes>.
+                // Here we send an Ok() to wrap around the Bytes so the poll_fn doesn't complain.
+                Ok(poll_value) => poll_value.map(Ok),
+                // The datagram_mut function may return a query error if it can't find the type
+                // referenced in the closure. Here we wrap the error in a Poll::Ready enum so the
+                // poll_fn doesn't complain.
+                Err(query_err) => Poll::Ready(Err(query_err)),
+            }
+        })
+        .await;
+        match send_result {
+            Ok(value) => match value {
+                Ok(_) => {
+                    bytes_sent.fetch_add(packet_size as u64, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    eprintln!("Failed to send datagram: {err:?}");
+                }
+            },
+            Err(err) => {
+                eprintln!("Failed to query datagram sender: {err:?}");
+            }
+        }
+    }
 }
