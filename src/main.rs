@@ -129,10 +129,10 @@ async fn run_quic_dgram_server(
     let addr: SocketAddr = addr.parse()?;
     let io = IoBuilder::default()
         .with_receive_address(addr)?
-        .with_base_mtu(1500)?
-        .with_initial_mtu(1500)?
         .with_send_buffer_size(4 * 1024 * 1024)?
         .with_recv_buffer_size(4 * 1024 * 1024)?
+        .with_base_mtu(1500)?
+        .with_initial_mtu(1500)?
         .build()
         .unwrap();
     // Create a datagram provider that has recv queue capacity
@@ -153,19 +153,21 @@ async fn run_quic_dgram_server(
     // 启动统计任务
     let _stats_handle = start_stats_task(Arc::clone(&bytes_received), "received").await;
 
-    while let Some(connection) = server.accept().await {
+    while let Some(mut connection) = server.accept().await {
+        connection.keep_alive(true).unwrap();
         // spawn a new task for the connection
         let bytes_clone = Arc::clone(&bytes_received);
         tokio::spawn(async move {
             println!("Connection accepted from {:?}", connection.remote_addr());
             loop {
-                let recv_result = futures::future::poll_fn(|cx| {
+                let recv_result = futures::future::poll_fn(|ctx| {
                     // datagram_mut takes a closure which calls the requested datagram function. The type
                     // of the closure parameter should be either the datagram Sender type or the
                     // datagram Receiver type. The datagram_mut function will check this type against
                     // its stored datagram Sender and Receiver, and if the type matches, the requested
                     // function will execute. Here, that requested function is poll_recv_datagram.
-                    match connection.datagram_mut(|recv: &mut Receiver| recv.poll_recv_datagram(cx))
+                    match connection
+                        .datagram_mut(|recv: &mut Receiver| recv.poll_recv_datagram(ctx))
                     {
                         // If the function is successfully called on the provider, it will return Poll<Bytes>.
                         // Here we send an Ok() to wrap around the Bytes so the poll_fn doesn't complain.
@@ -239,14 +241,14 @@ async fn run_quic_dgram_client(
     let _stats_handle = start_stats_task(Arc::clone(&bytes_sent), "sent").await;
 
     loop {
-        let send_result = futures::future::poll_fn(|cx| {
+        let send_result = futures::future::poll_fn(|ctx| {
             // datagram_mut takes a closure which calls the requested datagram function. The type
             // of the closure parameter should be either the datagram Sender type or the
             // datagram Receiver type. The datagram_mut function will check this type against
             // its stored datagram Sender and Receiver, and if the type matches, the requested
             // function will execute. Here, that requested function is poll_recv_datagram.
             match connection.datagram_mut(|send: &mut Sender| {
-                send.poll_send_datagram(&mut Bytes::clone(&packet_data), cx)
+                send.poll_send_datagram(&mut Bytes::clone(&packet_data), ctx)
             }) {
                 // If the function is successfully called on the provider, it will return Poll<Bytes>.
                 // Here we send an Ok() to wrap around the Bytes so the poll_fn doesn't complain.
