@@ -185,9 +185,16 @@ async fn run_quic_dgram_server(
                     // datagram Receiver type. The datagram_mut function will check this type against
                     // its stored datagram Sender and Receiver, and if the type matches, the requested
                     // function will execute. Here, that requested function is poll_recv_datagram.
-                    match connection
-                        .datagram_mut(|recv: &mut Receiver| recv.poll_recv_datagram(ctx))
-                    {
+                    match connection.datagram_mut(|recv: &mut Receiver| {
+                        loop {
+                            if let Some(data) = recv.recv_datagram() {
+                                bytes_clone.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            } else {
+                                break;
+                            }
+                        }
+                        recv.poll_recv_datagram(ctx)
+                    }) {
                         // If the function is successfully called on the provider, it will return Poll<Bytes>.
                         // Here we send an Ok() to wrap around the Bytes so the poll_fn doesn't complain.
                         Ok(poll_value) => poll_value.map(Ok),
@@ -267,6 +274,16 @@ async fn run_quic_dgram_client(
             // its stored datagram Sender and Receiver, and if the type matches, the requested
             // function will execute. Here, that requested function is poll_recv_datagram.
             match connection.datagram_mut(|send: &mut Sender| {
+                // loop {
+                //     match send.send_datagram(packet_data.clone()) {
+                //         Ok(_) => {
+                //             bytes_sent.fetch_add(packet_size as u64, Ordering::Relaxed);
+                //         }
+                //         Err(_) => {
+                //             break;
+                //         }
+                //     }
+                // }
                 send.poll_send_datagram(&mut packet_data.clone(), ctx)
             }) {
                 // If the function is successfully called on the provider, it will return Poll<Bytes>.
