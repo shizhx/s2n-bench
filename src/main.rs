@@ -12,7 +12,7 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio::time::interval;
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, ValueEnum)]
 enum Mode {
     #[value(name = "client")]
     Client,
@@ -20,7 +20,7 @@ enum Mode {
     Server,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, ValueEnum)]
 enum Scene {
     #[value(name = "stream")]
     Stream,
